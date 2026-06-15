@@ -1,0 +1,25 @@
+{
+  "realm": "poe2",
+  "league": "Runes of Aldur",
+  "auto_detect_league": true,
+  "poll_ms": 600,
+  "window_alpha": 0.94,
+  "always_on_top": true,
+  "enable_market_lookup": true,
+  "market_cache_minutes": 20,
+  "api_base_urls": [
+    "https://poe2scout.com/api",
+    "https://api.poe2scout.com/api"
+  ],
+  "user_agent": "PoE2ItemValuatorMVP/0.2 contact: change-me@example.com",
+  "currency_label": "ex",
+  "divine_label": "div",
+  "show_both_currencies": true,
+  "auto_trade_comparables": true,
+  "trade_min_interval_s": 2.5,
+  "request_timeout": 8,
+  "build_file": "",
+  "window_geometry": "450x580+1314+154",
+  "start_compact": false,
+  "fallback_divine_price": 0
+}

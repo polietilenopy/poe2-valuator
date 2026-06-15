@@ -1,0 +1,63 @@
+Copia uno de estos bloques completos para probar el overlay sin abrir el juego.
+
+==================== SAMPLE RARE RING ====================
+Item Class: Rings
+Rarity: Rare
+Victory Band
+Ruby Ring
+--------
+Requires Level 72
+--------
+Item Level: 80
+--------
++31% to Fire Resistance
+--------
++94 to maximum Life
++38% to Cold Resistance
++35% to Lightning Resistance
++24% to Chaos Resistance
++42 to Dexterity
+18% increased Rarity of Items found
+--------
+
+==================== SAMPLE BOOTS ====================
+Item Class: Boots
+Rarity: Rare
+Storm March
+Expert Feathered Sandals
+--------
+Quality: +20%
+Evasion Rating: 312
+--------
+Requires Level 78, 104 Dex
+--------
+Item Level: 82
+--------
++116 to maximum Life
+30% increased Movement Speed
++41% to Fire Resistance
++44% to Cold Resistance
++36% to Lightning Resistance
+Rune Sockets: 2
+--------
+
+==================== SAMPLE WEAPON ====================
+Item Class: Quarterstaves
+Rarity: Rare
+Dragon Weaver
+Expert Long Quarterstaff
+--------
+Quality: +20%
+Physical Damage: 145-310
+Critical Hit Chance: 11.00%
+Attacks per Second: 1.45
+--------
+Requires Level 78, 119 Dex, 119 Int
+--------
+Item Level: 82
+--------
+165% increased Physical Damage
+24% increased Attack Speed
++2 to Level of all Melee Skill Gems
++71 to Dexterity
+--------

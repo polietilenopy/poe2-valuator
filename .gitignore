@@ -1,0 +1,27 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.pyo
+
+# --- Artefactos de compilación (PyInstaller) ---
+build/
+dist/
+*.exe
+
+# --- Zips de distribución (se comparten como "Release", no en el repo) ---
+*.zip
+
+# --- Datos generados en runtime ---
+poe2scout_items_cache.json
+history.jsonl
+
+# --- Archivos de prueba/temporales del proyecto ---
+__sizetest.txt
+ziNrNZa6
+*.bak
+
+# --- Sistema / editores ---
+Thumbs.db
+.DS_Store
+.vscode/
+.idea/
