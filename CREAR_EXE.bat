@@ -37,6 +37,7 @@ echo [3/3] Compilando el .exe ^(puede tardar 1-3 minutos^)...
   --collect-submodules winrt ^
   --hidden-import build_to_filter ^
   --hidden-import rune_reward ^
+  --hidden-import text_match ^
   --hidden-import PIL.ImageGrab ^
   --hidden-import PIL.ImageTk ^
   --hidden-import winrt.runtime ^
@@ -49,6 +50,7 @@ echo [3/3] Compilando el .exe ^(puede tardar 1-3 minutos^)...
   --hidden-import winrt.windows.storage ^
   --add-data "build_to_filter.py;." ^
   --add-data "rune_reward.py;." ^
+  --add-data "text_match.py;." ^
   poe2_valuator_overlay.py
 
 echo.

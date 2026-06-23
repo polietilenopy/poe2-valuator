@@ -531,6 +531,74 @@ def infer_category(item: ParsedItem) -> str:
     return "unknown"
 
 
+def build_item_from_ocr(text: str, market=None) -> ParsedItem:
+    """Construye un ParsedItem desde texto OCR de una CAPTURA del tooltip de un item.
+
+    Diferencia clave con el Ctrl+C: el texto copiado trae 'Item Class:' y 'Rarity:',
+    pero una captura visual NO los tiene (solo nombre, base, propiedades y mods). Por
+    eso parse_item_text por si solo deja rarity=Unknown. Aca adaptamos:
+
+      1. Si el texto ya viene en formato copiado (tiene 'rarity:'/'rareza:'), se usa
+         parse_item_text tal cual.
+      2. Si es tooltip visual:
+         a. Probamos SOLO las primeras lineas (el nombre) contra los nombres de
+            UNIQUES del mercado (no contra bases) para no caer en falsos positivos
+            del tipo 'Quarterstaff' -> unique con base 'Long Quarterstaff'.
+         b. Si no es unique, lo tratamos como RARE e inferimos clase/base por
+            palabras clave, para que value() use los comparables del trade.
+
+    Las stats (vida, res, MS, DPS, mods) ya las extrae parse_item_text aunque no haya
+    separadores, asi que se conservan.
+    """
+    item = parse_item_text(text)
+    if item.rarity != "Unknown":
+        return item  # formato copiado: ya esta bien
+
+    if market is not None:
+        try:
+            market.ensure_loaded()
+        except Exception:
+            pass
+
+    raw = [clean_line(l) for l in (text or "").splitlines()]
+    lines = [l for l in raw if l]
+    if not lines:
+        return item
+    low_all = "\n".join(lines).lower()
+
+    # (a) ¿es un unique? match del NOMBRE (primeras 1-2 lineas) contra nombres de uniques
+    items = list(getattr(market, "_items", None) or []) if market is not None else []
+    uniq_names = [str(it.get("Name")) for it in items if it.get("Name")]
+    name_to_item = {_norm(str(it.get("Name"))): it for it in items if it.get("Name")}
+    for cand in lines[:2]:
+        if len(_norm(cand)) < 5:
+            continue
+        if _tm is not None and uniq_names:
+            mn, score, _why = _tm.best_match(cand, uniq_names)
+            if mn and score >= 0.9:
+                m = name_to_item.get(_norm(mn))
+                if m:
+                    item.rarity = "Unique"
+                    item.name = str(m.get("Name") or cand)
+                    item.base_type = str(m.get("Type") or item.base_type)
+                    item.category = infer_category(item)
+                    return item
+
+    # (b) no es unique: inferir base/clase por palabra clave y tratar como Rare
+    base_kw = next((kw for kw in (WEAPON_KEYWORDS + ARMOUR_KEYWORDS + ACCESSORY_KEYWORDS)
+                    if kw in low_all), None)
+    if base_kw:
+        item.item_class = base_kw.title()
+        if not item.base_type:
+            item.base_type = base_kw.title()
+        item.rarity = "Rare"
+        if not item.name:
+            item.name = lines[0]
+        item.category = infer_category(item)
+        item.notes.append("Valorado desde imagen (OCR): rareza/base inferidas; "
+                          "el Ctrl+C es mas preciso.")
+    return item
+
 
 # ======================================================================================
 # Calidad de rolls: compara cada mod contra su tope (T1) para decir que tan "perfecto" es.
@@ -1968,6 +2036,7 @@ class RuneAdvisorMixin:
         # F8 / boton Captura: abre un selector de area (recorte) y analiza esa zona.
         if not self._rune_ready():
             return
+        self._capture_target = self._rune_worker
         try:
             self._start_region_select()
         except Exception as exc:
@@ -2060,7 +2129,7 @@ class RuneAdvisorMixin:
                                             self._rune_popup(f"No pude capturar el area: {exc}")))
                 return
             self.root.after(0, self._safe_deiconify)
-            self._rune_worker(img)
+            getattr(self, "_capture_target", self._rune_worker)(img)
 
         self.root.after(220, lambda: threading.Thread(target=work, daemon=True).start())
 
@@ -2082,6 +2151,88 @@ class RuneAdvisorMixin:
             return
         self.root.after(0, lambda: self._rune_status("Recompensas analizadas."))
         self.root.after(0, lambda: self._show_rune_window(analysis, image_or_path))
+
+    # ============================================================================
+    # Valorar ITEM por captura (imagen). Reusa OCR + el mismo parser/valuador del Ctrl+C.
+    # ============================================================================
+    def value_item_image(self):
+        """Boton: elegir una imagen del tooltip de un item y valorarlo."""
+        if not self._rune_ready():   # mismo chequeo de OCR disponible
+            return
+        try:
+            from tkinter import filedialog
+            path = filedialog.askopenfilename(
+                title="Elige la captura del item (tooltip)",
+                filetypes=[("Imagenes", "*.png *.jpg *.jpeg *.bmp *.webp"), ("Todos", "*.*")],
+            )
+        except Exception:
+            path = ""
+        if not path:
+            return
+        self._rune_status("Leyendo imagen del item...")
+        threading.Thread(target=self._item_image_worker, args=(path,), daemon=True).start()
+
+    def capture_item_screen(self):
+        """Boton: seleccionar un area de la pantalla (el tooltip) y valorar ese item."""
+        if not self._rune_ready():
+            return
+        self._capture_target = self._item_image_worker
+        try:
+            self._start_region_select()
+        except Exception as exc:
+            self._rune_popup(f"No pude abrir el selector de area: {exc}")
+
+    def _item_image_worker(self, image_or_path):
+        """OCR de la imagen -> build_item_from_ocr -> valuador -> render_result."""
+        try:
+            img = (_rune_reward.load_image(image_or_path)
+                   if isinstance(image_or_path, str) else image_or_path)
+            text = _rune_reward.ocr_pil_image(img)
+        except Exception as exc:
+            err = "No pude leer el item de la imagen (OCR):\n" + "".join(
+                traceback.format_exception_only(type(exc), exc))
+            self.root.after(0, lambda: self._rune_popup(err))
+            return
+        if not (text or "").strip():
+            self.root.after(0, lambda: self._rune_popup(
+                "El OCR no leyo texto. Captura el tooltip del item mas grande y nitido, "
+                "sin que el cursor lo tape."))
+            return
+        try:
+            item = build_item_from_ocr(text, self.market)
+            result = self.valuator.value(item)
+            try:
+                self.advisor.annotate(item, result)
+            except Exception:
+                pass
+            try:
+                result.roll_quality_text = roll_quality_text(item)
+            except Exception:
+                result.roll_quality_text = ""
+            try:
+                append_history(item, result)
+            except Exception:
+                pass
+            import datetime
+            self._copied_at = datetime.datetime.now().strftime("%H:%M:%S") + " (imagen)"
+            icon = None
+            try:
+                icon = self._fetch_icon(result, item)
+            except Exception:
+                icon = None
+            self.root.after(0, lambda: self._render_value_result(item, result, icon))
+            self.root.after(0, lambda: self._rune_status("Item valorado desde imagen."))
+        except Exception as exc:
+            err = "Error valorando el item:\n" + "".join(
+                traceback.format_exception_only(type(exc), exc))
+            self.root.after(0, lambda: self._rune_popup(err))
+
+    def _render_value_result(self, item, result, icon=None):
+        """Llama a render_result de forma compatible con ambas UIs (con/sin icono)."""
+        try:
+            self.render_result(item, result, icon)   # UI moderna
+        except TypeError:
+            self.render_result(item, result)         # UI clasica
 
     # ---- ventana de resultados estilo "reward picker" (tk puro) ----
     def _show_rune_window(self, analysis, source=None):
@@ -2321,6 +2472,8 @@ class OverlayApp(RuneAdvisorMixin):
         controls2.pack(fill="x", pady=(6, 0))
         tk.Button(controls2, text="🪙 Runas: ¿cuál vender? (imagen)", command=self.read_rune_image, bg="#5a4a1f", fg="#ffffff", bd=0, padx=12, pady=6).pack(side="left")
         tk.Button(controls2, text="✂ Capturar área (F8)", command=self.capture_rune_screen, bg="#1f2a3a", fg="#ffffff", bd=0, padx=12, pady=6).pack(side="left", padx=6)
+        tk.Button(controls2, text="💰 Ítem por imagen", command=self.value_item_image, bg="#1f3a2a", fg="#ffffff", bd=0, padx=12, pady=6).pack(side="left")
+        tk.Button(controls2, text="✂ Ítem (capturar área)", command=self.capture_item_screen, bg="#2a1f3a", fg="#ffffff", bd=0, padx=12, pady=6).pack(side="left", padx=6)
 
         self.status_var = tk.StringVar(value=f"Liga: {self.config.get('league')} | Realm: {self.config.get('realm')}")
         tk.Label(body, textvariable=self.status_var, fg="#8588a3", bg="#101018", anchor="w", font=("Segoe UI", 8)).pack(fill="x", pady=(8, 0))
@@ -2883,6 +3036,20 @@ class OverlayAppModern(RuneAdvisorMixin):
                       corner_radius=8, font=self._font(12), height=32, width=130)
         capt_btn.pack(side="left", padx=2)
         _Tooltip(capt_btn, "Te deja dibujar un recuadro sobre la pantalla para leer ahí mismo el panel de recompensas y calcular su valor, sin subir archivos (atajo: F8).")
+
+        # Fila para valorar un ITEM por captura (OCR -> mismo valuador del Ctrl+C)
+        item_row = ctk.CTkFrame(r, fg_color="transparent")
+        item_row.pack(fill="x", padx=8, pady=(0, 6))
+        itimg_btn = ctk.CTkButton(item_row, text="💰 Valorar ítem (imagen)", command=self.value_item_image,
+                      fg_color="#1f3a2a", hover_color="#2c5a40", text_color="#eafff2",
+                      corner_radius=8, font=self._font(12, "bold"), height=32)
+        itimg_btn.pack(side="left", expand=True, fill="x", padx=2)
+        _Tooltip(itimg_btn, "Sube una imagen del tooltip de un ítem y lo valora con el mismo motor que el Ctrl+C (precio real de uniques/currency, y comparables del trade para rares). El Ctrl+C sigue siendo más preciso.")
+        itcap_btn = ctk.CTkButton(item_row, text="✂ Ítem (área)", command=self.capture_item_screen,
+                      fg_color=C_PANEL2, hover_color="#2c5a40", text_color=C_TEXT,
+                      corner_radius=8, font=self._font(12), height=32, width=130)
+        itcap_btn.pack(side="left", padx=2)
+        _Tooltip(itcap_btn, "Dibuja un recuadro sobre el tooltip de un ítem en pantalla y lo valora directo, sin subir archivos.")
         tb2 = ctk.CTkFrame(r, fg_color="transparent")
         tb2.pack(fill="x", padx=10, pady=(0, 4))
         self.auto_sw = ctk.CTkSwitch(tb2, text="Auto-precio (trade en vivo)", font=self._font(12),

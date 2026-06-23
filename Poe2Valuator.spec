@@ -2,9 +2,9 @@
 from PyInstaller.utils.hooks import collect_submodules
 from PyInstaller.utils.hooks import collect_all
 
-datas = [('build_to_filter.py', '.'), ('rune_reward.py', '.'), ('text_match.py', '.')]
+datas = [('build_to_filter.py', '.'), ('rune_reward.py', '.')]
 binaries = []
-hiddenimports = ['build_to_filter', 'rune_reward', 'text_match', 'PIL.ImageGrab', 'PIL.ImageTk', 'winrt.runtime', 'winrt.windows.media.ocr', 'winrt.windows.globalization', 'winrt.windows.graphics.imaging', 'winrt.windows.storage.streams', 'winrt.windows.foundation', 'winrt.windows.foundation.collections', 'winrt.windows.storage']
+hiddenimports = ['build_to_filter', 'rune_reward', 'PIL.ImageGrab', 'PIL.ImageTk', 'winrt.runtime', 'winrt.windows.media.ocr', 'winrt.windows.globalization', 'winrt.windows.graphics.imaging', 'winrt.windows.storage.streams', 'winrt.windows.foundation', 'winrt.windows.foundation.collections', 'winrt.windows.storage']
 hiddenimports += collect_submodules('winrt')
 tmp_ret = collect_all('customtkinter')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]

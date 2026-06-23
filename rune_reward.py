@@ -477,8 +477,38 @@ def analyze_image(image_or_path, market) -> Analysis:
     return analyze_text(text, market)
 
 
+_ITEM_TOOLTIP_MARKERS = (
+    "attacks per second", "critical hit chance", "requires level", "item level",
+    "physical damage", "energy shield", "evasion rating", "ataques por segundo",
+    "probabilidad de golpe", "requiere nivel", "nivel de objeto", "dano fisico",
+)
+
+
+def looks_like_item_tooltip(text: str) -> bool:
+    """Detecta si el OCR es el tooltip de UN item (arma/armadura) y no un panel de
+    recompensas. Asi evitamos emparejar bases a uniques por error (falsos positivos).
+    """
+    low = _norm(text or "")
+    hits = sum(1 for m in _ITEM_TOOLTIP_MARKERS if _norm(m) in low)
+    # lineas tipo "Nx Nombre" (recompensas). Si hay varias, es un panel de recompensas.
+    reward_lines = 0
+    for raw in (text or "").splitlines():
+        if re.match(r"^\s*\d+\s*[xX×]\s+\S", raw):
+            reward_lines += 1
+    return hits >= 2 and reward_lines <= 1
+
+
 def analyze_text(text: str, market) -> Analysis:
     """Combina nombres de runa + recompensas de currency, con veredicto VENDER/USAR."""
+    # Si parece el tooltip de un item suelto, no lo proceses como recompensas:
+    # los mods/bases producen mismatches (p. ej. una base -> unique). Sugerir el
+    # boton de valuacion de item.
+    if looks_like_item_tooltip(text):
+        return Analysis(ocr_text=text, error=(
+            "Esto parece el tooltip de un ITEM, no un panel de recompensas de runas.\n\n"
+            "Para valorarlo usa el boton  \U0001f4b0 Valorar item (imagen)  (OCR + el mismo "
+            "motor del Ctrl+C). El lector de recompensas es solo para el panel de "
+            "Runeshape Combinations / Ezomyte Remnant."))
     try:
         market.ensure_loaded()
     except Exception:
