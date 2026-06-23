@@ -29,6 +29,11 @@ import re
 from dataclasses import dataclass, field
 from typing import Optional
 
+try:
+    import text_match as _tm  # matching robusto compartido (Levenshtein acotado + OCR)
+except Exception:  # pragma: no cover - si falta, caemos a difflib
+    _tm = None
+
 
 # Delata que una linea OCR contiene la palabra "rune" (tolera erratas OCR).
 _RUNE_HINT = re.compile(r"r[uv]n[ce]", re.IGNORECASE)
@@ -147,6 +152,15 @@ def match_rune(detected: str, index: dict) -> tuple:
         if det_tier and off_tier and det_tier != off_tier:
             note = f"precio del tier rastreado «{item.get('Text')}» (aprox. para «{detected}»)"
         return item, note, "media" if note else "alta"
+    # Capa principal: matching robusto (Levenshtein acotado + OCR) si esta disponible.
+    if _tm is not None and index["names"]:
+        cand_name, score, _why = _tm.best_match(detected, index["names"])
+        if cand_name and score >= 0.80:
+            item = index["by_norm"].get(_norm(cand_name))
+            if item:
+                conf = "alta" if score >= 0.95 else "media"
+                return item, f"emparejado por similitud a «{item.get('Text')}» ({_why})", conf
+    # Respaldo: difflib por ratio.
     cand = difflib.get_close_matches(norm, [_norm(n) for n in index["names"]], n=1, cutoff=0.72)
     if cand:
         item = index["by_norm"].get(cand[0])
@@ -386,7 +400,13 @@ def _match_catalog_item(body: str, full_index: dict, names_sorted: Optional[list
         for nm in names_sorted:
             if kn in nm and _priced(full_index[nm]):
                 return full_index[nm]
-    # 4. difuso (tolera errores de OCR como letras cambiadas)
+    # 4. difuso: matching robusto (Levenshtein acotado + OCR) restringido a items con precio.
+    if _tm is not None:
+        priced_names = [nm for nm in names_sorted if _priced(full_index.get(nm))]
+        cand_name, score, _why = _tm.best_match(kn, priced_names, min_len=4)
+        if cand_name and score >= 0.82:
+            return full_index[cand_name]
+    # 4b. respaldo difflib por ratio.
     cand = difflib.get_close_matches(kn, names_sorted, n=1, cutoff=0.84)
     if cand and _priced(full_index[cand[0]]):
         return full_index[cand[0]]

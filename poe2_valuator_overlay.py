@@ -27,6 +27,10 @@ try:
 except Exception:
     _rune_reward = None
 try:
+    import text_match as _tm  # matching robusto (Levenshtein acotado + OCR) compartido
+except Exception:
+    _tm = None
+try:
     from build_to_filter import build_profile as _derive_build_profile, generate_filter as _generate_filter
 except Exception:
     _derive_build_profile = None
@@ -89,6 +93,13 @@ DEFAULT_CONFIG = {
     "build_file": "",
     "window_geometry": "",
     "start_compact": False,
+    # Decision vender-en-mercado vs convertir-en-oro: si el valor de mercado del
+    # item es menor a este umbral (en exalted), conviene venderlo al mercader por oro.
+    "convert_to_gold_below_ex": 1.0,
+    # Fuente de respaldo de economia de currencies (poe.ninja). Off por defecto:
+    # poe2scout ya cubre todos los currencies; activalo si quieres rellenar faltantes.
+    "enable_poeninja_fallback": False,
+    "poeninja_base_url": "https://poe.ninja/poe2/api",
 }
 
 RARITY_MAP = {
@@ -264,6 +275,9 @@ class ValuationResult:
     build_irrelevant: list[str] = field(default_factory=list)
     compare_text: str = ""
     roll_quality_text: str = ""
+    market_value_ex: float = 0.0   # valor numerico de mercado en exalted (para decidir oro vs mercado)
+    gold_verdict: str = ""         # "MERCADO" | "ORO" | "" (se calcula al renderizar)
+    gold_estimate: str = ""        # estimado aproximado de oro del mercader (sin fuente exacta)
 
 
 def split_sections(lines: list[str]) -> list[list[str]]:
@@ -611,6 +625,48 @@ def _norm(text: str) -> str:
     return re.sub(r"\s+", " ", text)
 
 
+def gold_decision(market_value_ex: float, threshold_ex: float) -> str:
+    """Decide si conviene VENDER EN MERCADO u ORO (mercader) segun el valor en ex.
+
+    Si el valor de mercado es menor al umbral configurable, no vale la pena
+    listarlo: mejor convertirlo en oro con el mercader.
+    """
+    try:
+        v = float(market_value_ex or 0.0)
+        thr = float(threshold_ex or 0.0)
+    except Exception:
+        return ""
+    if v <= 0:
+        return "ORO"
+    return "ORO" if v < thr else "MERCADO"
+
+
+# Valores BASE aproximados de oro por mercader segun rareza (PoE2). NO hay API ni
+# formula publica: el oro real depende de rareza, ilvl, mods e identificacion, asi
+# que esto es solo una ESTIMACION orientativa (rango), claramente etiquetada.
+_GOLD_BASE_BY_RARITY = {"Normal": 30, "Magic": 120, "Rare": 1200, "Unique": 1200}
+
+
+def estimate_vendor_gold(item: "ParsedItem") -> str:
+    """Estimacion aproximada (rango) del oro que da el mercader. Orientativa.
+
+    Escala el valor base por rareza con el item level. Devuelve un texto tipo
+    "~2.0k-3.2k oro (aprox)" o "" si no hay datos suficientes.
+    """
+    base = _GOLD_BASE_BY_RARITY.get(item.rarity, 0)
+    if base <= 0:
+        return ""
+    ilvl = item.item_level or 0
+    factor = 1.0 + min(max(ilvl, 0), 86) / 86.0 * 1.6  # ilvl 0->1.0x, 86->2.6x
+    mid = base * factor
+    lo, hi = mid * 0.8, mid * 1.2
+
+    def _k(n: float) -> str:
+        return f"{n/1000:.1f}k" if n >= 1000 else f"{int(round(n))}"
+
+    return f"~{_k(lo)}-{_k(hi)} oro (aprox.)"
+
+
 class MarketClient:
     """Cliente del mercado contra la API real de poe2scout.com.
 
@@ -768,11 +824,30 @@ class MarketClient:
                     k = _norm(key)
                     # no pisar entradas ya existentes con bases genericas (Type compartido por varios uniques)
                     self._index.setdefault(k, it)
-            if it.get("CategoryApiId") == "currency" and it.get("ApiId"):
+            if it.get("CategoryApiId") == "currency":
+                # Registramos CADA currency bajo varias claves normalizadas (ApiId,
+                # Text, Name y variantes con/sin "orb" y con guiones<->espacios) para
+                # que currency_to_ex resuelva CUALQUIER codigo de moneda del trade
+                # (divine, chaos, regal, vaal, annul, alch...) y no solo exalted.
                 try:
-                    self._currency_ex[_norm(str(it.get("ApiId")))] = float(it.get("CurrentPrice") or 0)
+                    price = float(it.get("CurrentPrice") or 0)
                 except Exception:
-                    pass
+                    price = 0.0
+                if price > 0:
+                    raw_keys = [it.get("ApiId"), it.get("Text"), it.get("Name")]
+                    for rk in raw_keys:
+                        if not rk:
+                            continue
+                        base = _norm(str(rk))
+                        for variant in {
+                            base,
+                            base.replace(" orb", "").strip(),
+                            base.replace("-", " ").strip(),
+                            base.replace(" ", "-").strip(),
+                            base.replace("-", " ").replace(" orb", "").strip(),
+                        }:
+                            if variant and variant not in self._currency_ex:
+                                self._currency_ex[variant] = price
             # el nombre del unique tiene prioridad de match
             if name:
                 self._index[_norm(name)] = it
@@ -802,6 +877,12 @@ class MarketClient:
                     self._items = [x for x in data if isinstance(x, dict)]
                     self._fetched_at = now_iso()
                     self._build_index()
+                    # Respaldo opcional: rellena currencies faltantes desde poe.ninja.
+                    if self.config.get("enable_poeninja_fallback", False):
+                        try:
+                            self._augment_currency_from_poeninja(league)
+                        except Exception:
+                            pass
                     self._write_cache_file()
                     self._last_error = ""
                     dp = f" | 1 div ≈ {self._divine_price:g} ex" if self._divine_price else ""
@@ -817,10 +898,105 @@ class MarketClient:
         self.status("Mercado no disponible; usando heurística local.")
 
     def currency_to_ex(self, currency_id: str) -> float:
-        """Convierte una moneda del trade (exalted/divine/chaos/regal/...) a exalted."""
+        """Convierte una moneda del trade (exalted/divine/chaos/regal/...) a exalted.
+
+        IMPORTANTE: el trade oficial cotiza la mayoria de los rares valiosos en
+        *divine*. Antes solo conociamos 'exalted' y dependiamos de que el ApiId
+        de poe2scout coincidiera con el codigo del trade (p. ej. 'divine' vs
+        'divine-orb'); cuando no coincidia devolviamos 0 y se DESCARTABAN todos
+        los listings en divine -> precios artificialmente bajos (0-2 ex). Ahora
+        resolvemos exalted y divine de forma directa y robusta.
+        """
         if not currency_id:
             return 0.0
-        return float(self._currency_ex.get(_norm(str(currency_id)), 0.0))
+        cid = _norm(str(currency_id))
+        # Exalted es la moneda base.
+        if cid in ("exalted", "exalted orb", "ex", "exalt", "exa"):
+            return 1.0
+        # Divine: usamos el precio en ex que ya trae la liga (DivinePrice).
+        if cid in ("divine", "divine orb", "div", "divine-orb") and self._divine_price > 0:
+            return float(self._divine_price)
+        # Resto de monedas: buscar en el indice de poe2scout, probando variantes
+        # de nombre (con/sin ' orb', guiones <-> espacios).
+        variants = {
+            cid,
+            cid.replace(" orb", "").strip(),
+            cid.replace("-", " ").strip(),
+            cid.replace(" ", "-").strip(),
+            cid.replace("-", " ").replace(" orb", "").strip(),
+        }
+        for v in variants:
+            val = self._currency_ex.get(v)
+            if val:
+                return float(val)
+        return 0.0
+
+    def _augment_currency_from_poeninja(self, league: str) -> None:
+        """Respaldo OPCIONAL: rellena currencies que falten usando poe.ninja.
+
+        Endpoint (poe2): /economy/currencyexchange/overview?leagueName=..&overviewName=Currency
+        Respuesta: { "items": [{id, name, icon, tradeId}], "lines": [{<idKey>, ...valores}] }
+
+        Estrategia segura:
+          * Solo AÑADE claves que poe2scout no tenga (nunca pisa precios reales).
+          * Indexa por `tradeId` (== codigo de moneda del trade) y por `name`.
+          * El valor se toma del campo numerico mas plausible de cada linea, en
+            relacion a exalted (moneda base de poe2). Es un respaldo: poe2scout
+            sigue siendo la fuente primaria.
+
+        NOTA: el formato exacto de `lines` de poe.ninja puede variar; por eso esto
+        va detras de `enable_poeninja_fallback` y nunca rompe la carga (todo en
+        try/except). Conviene una validacion en vivo la primera vez que se active.
+        """
+        base = str(self.config.get("poeninja_base_url", "https://poe.ninja/poe2/api")).rstrip("/")
+        url = (f"{base}/economy/currencyexchange/overview"
+               f"?leagueName={urllib.parse.quote(league)}&overviewName=Currency")
+        data = self._get_json(url)
+        if not isinstance(data, dict):
+            return
+        items = data.get("items") or data.get("currencyDetails") or []
+        lines = data.get("lines") or []
+        # Mapa idKey -> metadatos (tradeId/name)
+        meta: dict[str, dict] = {}
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            key = str(it.get("id") if it.get("id") is not None else it.get("currencyTypeName") or "")
+            if key:
+                meta[key] = it
+
+        def _line_value_ex(ln: dict) -> float:
+            # Buscamos el primer campo numerico positivo plausible (en ex).
+            for fld in ("primaryValue", "value", "chaosEquivalent", "exaltedValue", "secondaryValue"):
+                try:
+                    v = float(ln.get(fld))
+                    if v > 0:
+                        return v
+                except Exception:
+                    continue
+            return 0.0
+
+        added = 0
+        for ln in lines:
+            if not isinstance(ln, dict):
+                continue
+            idkey = str(ln.get("currencyTypeName") if ln.get("currencyTypeName") is not None
+                        else ln.get("id") if ln.get("id") is not None else ln.get("itemId") or "")
+            info = meta.get(idkey, {})
+            trade_id = info.get("tradeId") or ln.get("tradeId")
+            name = info.get("name") or info.get("currencyTypeName") or ln.get("name")
+            value = _line_value_ex(ln)
+            if value <= 0:
+                continue
+            for raw in (trade_id, name):
+                if not raw:
+                    continue
+                k = _norm(str(raw))
+                if k and k not in self._currency_ex:   # nunca pisa poe2scout
+                    self._currency_ex[k] = value
+                    added += 1
+        if added:
+            self.status(f"poe.ninja: +{added} tasas de currency de respaldo.")
 
     # ---------- búsqueda ----------
     def find_market_item(self, item: ParsedItem) -> dict[str, Any] | None:
@@ -837,14 +1013,28 @@ class MarketClient:
             match = self._index.get(_norm(f"{item.name} {item.base_type}"))
             if match:
                 return match
-        # 3) match flexible por substring (solo nombres con longitud razonable)
+        # 3) match flexible y SEGURO: contencion por palabra completa + similitud
+        #    acotada. Antes esto recorria el dict y devolvia el PRIMER key donde
+        #    "lname in key or key in lname" — eso casaba parciales equivocados
+        #    (un nombre corto contenido en otro mas largo no relacionado) y el
+        #    resultado dependia del orden del diccionario. Ahora elegimos el mejor.
+        keys = list(self._index.keys())
         for name in item.searchable_names:
             lname = _norm(name)
             if len(lname) < 4:
                 continue
-            for key, match in self._index.items():
-                if lname == key or lname in key or key in lname:
-                    return match
+            if _tm is not None:
+                cand, score, _why = _tm.best_match(lname, keys, min_len=4)
+                if cand and score >= 0.9:  # exacto o contencion por palabra completa
+                    return self._index[cand]
+            else:
+                # Respaldo sin text_match: solo contencion por palabra completa.
+                for key in keys:
+                    if lname == key:
+                        return self._index[key]
+                    if re.search(r"(?:^| )" + re.escape(lname) + r"(?: |$)", key) or \
+                       re.search(r"(?:^| )" + re.escape(key) + r"(?: |$)", lname):
+                        return self._index[key]
         return None
 
 
@@ -979,6 +1169,7 @@ class HeuristicValuator:
             reasons=reasons,
             warnings=warnings,
             raw_market_match=match,
+            market_value_ex=price,
         )
 
     def _comparables_result(self, item: ParsedItem, comp: dict) -> ValuationResult:
@@ -1007,6 +1198,7 @@ class HeuristicValuator:
             reasons=reasons,
             warnings=warnings,
             raw_market_match={"comparables": comp, "IconUrl": comp.get("icon")},
+            market_value_ex=float(med if med else mn),
         )
 
     # Anclas de precio en EXALTED por banda de score (lo, hi, quick, ambicioso)
@@ -1029,6 +1221,17 @@ class HeuristicValuator:
         fair_text = self._fmt_range(quick, hi)
         amb_text = self._fmt(amb) + (" (si hay demanda)" if score >= 75 else "")
         return price_text, quick_text, fair_text, amb_text
+
+    def _score_to_value_ex(self, score: float) -> float:
+        """Valor numerico de venta rapida (en ex) segun la banda de score.
+
+        Sirve para la decision vender-en-mercado vs oro cuando no hay precio real
+        (rares con heuristica local)."""
+        lo = hi = quick = amb = 0.0
+        for threshold, (lo, hi, quick, amb) in self._PRICE_BANDS:
+            if score < threshold:
+                break
+        return float(quick)
 
     def _confidence(self, item: ParsedItem, score: float) -> str:
         hits = len(item.stats)
@@ -1154,6 +1357,7 @@ class HeuristicValuator:
             score=round(score, 1),
             reasons=reasons[:8],
             warnings=warnings[:6],
+            market_value_ex=self._score_to_value_ex(score),
         )
 
     def _value_weapon(self, item: ParsedItem) -> ValuationResult:
@@ -1243,6 +1447,7 @@ class HeuristicValuator:
             score=round(score, 1),
             reasons=reasons[:8],
             warnings=warnings[:6],
+            market_value_ex=self._score_to_value_ex(score),
         )
 
 
@@ -2230,6 +2435,15 @@ class OverlayApp(RuneAdvisorMixin):
         self.high_var.set(f"Precio ambicioso: {result.ambitious_price}")
 
         lines: list[str] = []
+        verdict = gold_decision(result.market_value_ex, self.config.get("convert_to_gold_below_ex", 1.0))
+        if verdict and (result.market_value_ex > 0 or item.rarity in {"Normal", "Magic", "Rare", "Unique"}):
+            gold_est = estimate_vendor_gold(item)
+            if verdict == "MERCADO":
+                lines.append(f"DECISIÓN: ✅ VENDER EN MERCADO (~{result.market_value_ex:g} ex)")
+            else:
+                tip = f" · {gold_est}" if gold_est else ""
+                lines.append(f"DECISIÓN: 🪙 CONVERTIR EN ORO con el mercader (mercado ~{result.market_value_ex:g} ex, por debajo del umbral){tip}")
+            lines.append("")
         if result.build_fit is not None:
             lines.append("PARA TU BUILD")
             lines.append(f"  {result.build_verdict}  (afinidad {result.build_fit:g}/100)")
@@ -3014,6 +3228,15 @@ class OverlayAppModern(RuneAdvisorMixin):
 
         # Detalle
         lines = []
+        verdict = gold_decision(result.market_value_ex, self.config.get("convert_to_gold_below_ex", 1.0))
+        if verdict and (result.market_value_ex > 0 or item.rarity in {"Normal", "Magic", "Rare", "Unique"}):
+            if verdict == "MERCADO":
+                lines.append(f"DECISIÓN: ✅ VENDER EN MERCADO (~{result.market_value_ex:g} ex)")
+            else:
+                gold_est = estimate_vendor_gold(item)
+                tip = f" · {gold_est}" if gold_est else ""
+                lines.append(f"DECISIÓN: 🪙 CONVERTIR EN ORO con el mercader (mercado ~{result.market_value_ex:g} ex){tip}")
+            lines.append("")
         if result.build_fit is not None:
             if result.build_reasons:
                 lines.append("PARA TU BUILD — aporta: " + ", ".join(result.build_reasons[:8]))
